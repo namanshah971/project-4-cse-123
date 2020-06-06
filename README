@@ -1,0 +1,124 @@
+[Project 3 student solution]
+
+High level code description:
+
+Once a packet arrives at the router, the code eventually reaches 
+sr_handlepacket() in sr_router.c. Here we determine the packet type--if 
+the packet is and ARP request or reply or simply an IP packet and delegate
+to appropriate functions which works as described below:
+
+For ARP requests, we send a ARP reply back from the original receiving
+interface. For ARP replies, we look into our request queue to send the packets
+that were waiting on this ARP request reply. 
+
+For IP packets, we that aren't ARP request or replies, if it is destined for 
+the router we ignore it; otherwise the router decrements TTL, recomputes 
+checksum and forwards the packet. However, if the TTL is 0, the router sends 
+an ICMP time exceeded code 0 message back to the original ip source. When 
+attempting to forward the packet, if the router cannot find an entry for the a
+next hop address for the ip destination, then the router sends an ICMP 
+destination net unreachable message back to the original ip source. If it does
+find an entry and gets no reponse after the ARP request for the next hop entry 
+is sent five times then it sends an ICMP destination net or host unreachable 
+respectively back to the original ip source. Note ARP requests that have not 
+been responded to are resent approximately every second.
+
+
+File changes:
+sr_router.c/h:
+    -Added implementation functions and declarations.
+    
+sr_arpcache.c/h:
+    -Implemented sr_arpcache_sweepreqs().
+
+sr_protocol.h file changes:
+    -Added structs for different ICMP packet headers and also a generic ICMP
+    header struct.
+
+
+High level description of major functions:
+
+In sr_router.c:
+
+sr_handlepacket_():
+    Determines what function to delegate to depending on packet type.
+
+sr_handlepacket_arp_request():
+    Only process ARP requests for the router's receiving interface ip.
+    Send a ARP reply back from the interface which received the ARP request.
+    The arp reply source ip will be the ip of this interface and the ARP reply
+    destination ip will be the original source ip of the ARP request. Also,
+    set source MAC addresses in ethernet header and ARP header of the reply to
+    be address of the original receiving interface. The destination mac 
+    addresses of the reply will be original source mac addresses.
+
+sr_handlepacket_arp_reply():
+    Only process ARP replies to the router's receiving interface ip.
+    Locate the request by calling sr_arpcache_locate_req to find the request 
+    object for that ARP reply source IP (the original request target ip). From 
+    this request object, the router can now send the packets that were waiting 
+    on this ARP reply, since now the destination mac address is known (source
+    hardware address in the ARP header of the ARP reply). Destroy the request
+    after processing.
+
+sr_handlepacket_ip():
+    Determine if the packet is destined for one of the router's interfaces.
+    If yes, then only handle ICMP packets by calling sr_handlepacket_icmp().
+    If not, then delegate to sr_handleforwarding_ip() to forward the 
+    packet. 
+
+sr_handlepacket_icmp():
+    Ignore packet unless it is an ICMP echo requests. Delegates to 
+    sr_send_ICMP_packet() with type 0 and code 0 to send an echo reply.
+
+sr_handleforwarding_ip():
+    Create new packet to forward with the TTL decremented. If TTL is 0, call 
+    sr_send_ICMP_packet() with type 11 and code 0 to send a time exceeded
+    message back to the original IP source. Else, call sr_add_dest_mac_addr()
+    to determine MAC address of next hop to continue forwading process.
+
+sr_send_ICMP_packet():
+    Determines what function to call based on ICMP type passed in.
+
+sr_send_ICMP_t0_packet();
+    Sends an ICMP echo reply message back to the original ip source. The
+    packet will be of the same length and contains the same matching fields
+    in the ICMP header and data poirtion as the echo request.
+
+sr_send_ICMP_t3_packet():
+    Sends an ICMP destination unreachable message (either net or host 
+    unreachable) back to the original IP source. The ICMP data will be the 
+    original packet's IP header and the first 8 bytes of the original IP data.
+
+sr_send_ICMP_t11_packet():
+    Sends a time exceeded ICMP message (net or host unreachable) back to the 
+    original IP source. The ICMP data will be the original packet's IP header 
+    and the first 8 bytes of the original IP data.
+
+sr_send_arp_req():
+    Sends an ARP request (broadcast) for the passed in target IP from the 
+    passed in send interface.
+
+sr_send_arp_req_again():
+    The ARP request source ip is determined and then sr_send_arp_req() is called
+    to resend an ARP request.
+
+sr_add_dest_mac_addr();
+    Looks for in routing table to determine next hop ip. If found, store the 
+    packet that is being forwarded and then sends the ARP request. If not found,
+    send a destination net unreachable by calling sr_send_ICMP_packet() with 
+    type 3 code 0.
+
+sr_arpcache_locate_req():
+    Locates and return the request object from the cache request queue. The 
+    cache lock should be acquired before and sometime after calling this 
+    function.                                         
+
+In sr_arpcache.c:
+
+sr_arpcache_sweepreqs():
+    Goes through the ARP request queue of the router. Process requests where it
+    has been at least 1 second since the last sent time. Check if the request 
+    has been sent five times. If so send a destination host unreachable back to 
+    all packets waiting for this ARP request. Otherwise, increment the number of
+    times sent and update the last sent time.
