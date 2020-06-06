@@ -1,5 +1,3 @@
-[Project 3 student solution]
-
 High level code description:
 
 Once a packet arrives at the router, the code eventually reaches 
@@ -8,8 +6,8 @@ the packet is and ARP request or reply or simply an IP packet and delegate
 to appropriate functions which works as described below:
 
 For ARP requests, we send a ARP reply back from the original receiving
-interface. For ARP replies, we look into our request queue to send the packets
-that were waiting on this ARP request reply. 
+interface and cache the sender's ip/mac address. For ARP replies, we look into our request queue to send the packets
+that were waiting on this ARP request reply and and cache the sender's ip/mac address. 
 
 For IP packets, we that aren't ARP request or replies, if it is destined for 
 the router we ignore it; otherwise the router decrements TTL, recomputes 
