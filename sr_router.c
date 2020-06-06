@@ -173,6 +173,8 @@ void sr_handlepacket_arp_request(struct sr_instance* sr,
 
     /* If the target ip is the receiving interface */
     if (arp_hdr->ar_tip == rec_if->ip) {
+        sr_arpcache_insert(&sr->cache, arp_hdr->ar_sha, arp_hdr->ar_sip);
+
         /* Prepare response */
         uint32_t total_length = sizeof(sr_arp_hdr_t) + sizeof(sr_ethernet_hdr_t);
         uint8_t * res_packet = malloc(total_length);
@@ -213,7 +215,7 @@ void sr_handlepacket_arp_request(struct sr_instance* sr,
 void sr_handlepacket_arp_reply(struct sr_instance* sr, 
                                uint8_t * packet/* lent */,
                                unsigned int len, char* interface/* lent */)
-{
+{ 
     fprintf(stderr, "Handling arp reply\n");
 
     sr_ethernet_hdr_t *ehdr = (sr_ethernet_hdr_t *)packet;
@@ -240,7 +242,9 @@ void sr_handlepacket_arp_reply(struct sr_instance* sr,
         /* Process queue for corresponding request to send packets */
 
         pthread_mutex_lock(&(sr->cache.lock));
-        struct sr_arpreq * request = sr_arpcache_locate_req(&sr->cache, arp_hdr->ar_sip);
+        struct sr_arpreq * request = sr_arpcache_insert(&sr->cache, arp_hdr->ar_sha, arp_hdr->ar_sip);
+
+        /*struct sr_arpreq * request = sr_arpcache_locate_req(&sr->cache, arp_hdr->ar_sip);*/
         
         /* Send all packets that was waiting for this request response */
         if (request) {
@@ -331,7 +335,7 @@ void sr_handlepacket_ip(struct sr_instance* sr, uint8_t * packet/* lent */,
     /* Check if ip destination one of this router's interfaces' ip */
     struct sr_if * curr_iface = sr->if_list;
 
-    /* Go through list to look for a match; if none reach end of list (null) */
+    /* Go through list to look for a match; if none reach end of list (NULL) */
     while (curr_iface) {
         if (curr_iface->ip == iphdr->ip_dst) {
             break;
@@ -354,8 +358,11 @@ void sr_handlepacket_ip(struct sr_instance* sr, uint8_t * packet/* lent */,
             
             sr_handlepacket_icmp(sr, packet, len, curr_iface, interface);
 
-        } else {
-            /* Just regular IP */
+        } else if(ip_pro == ip_protocol_tcp || ip_pro == ip_protocol_udp){
+            sr_send_ICMP_packet(sr, packet, len,  interface, 3, 3);
+        }
+        else{
+            return;
         }
 
     } else {
@@ -496,21 +503,26 @@ void sr_add_dest_mac_addr(struct sr_instance* sr,
     struct sr_rt * rtable_node = sr->routing_table;
 
     /* Try to find exact matching entry for next hop ip */
+     struct sr_rt * match_node = NULL;
+     uint32_t match_length; 
     while(rtable_node) {
         /* If destination ip in entry matches, break */
-        if (rtable_node->dest.s_addr == dest_ip) {
-            break;            
+        uint32_t match = rtable_node->mask.s_addr & dest_ip;
+        if (match == rtable_node->dest.s_addr) {
+            if(match_node==NULL || match_length < rtable_node->mask.s_addr){
+                match_node = rtable_node;
+                match_length = rtable_node->mask.s_addr;
+            }           
         }
-
         rtable_node = rtable_node->next;
     }
 
     /* If matching entry found in routing table */
-    if (rtable_node) {
+    if (match_node) {
         /* Get interface object from which to send */
-        struct sr_if * arp_req_send_iface = sr_get_interface(sr, rtable_node->interface);
+        struct sr_if * arp_req_send_iface = sr_get_interface(sr, match_node->interface);
 
-        uint32_t arp_req_target_ip = rtable_node->gw.s_addr;
+        uint32_t arp_req_target_ip = match_node->gw.s_addr;
 
         fprintf(stderr, "Storing packet before doing arp request\n");
 
@@ -519,20 +531,38 @@ void sr_add_dest_mac_addr(struct sr_instance* sr,
         print_hdr_eth(send_ehdr);
         print_hdr_ip(send_iphdr);
 
-        /* TODO*/
-        /* These two functions should always be together */
-        /* Store request in queue, note 2nd parameter is ARP request IP (not intended 
-           IP dest of packet that is being stored)*/
-        struct sr_arpreq* request = sr_arpcache_queuereq(&sr->cache, arp_req_target_ip,
-                                                         send_packet, send_len, original_rec_if->name);
+        struct sr_arpentry* entry = sr_arpcache_lookup(&sr->cache, dest_ip);
 
-        sr_send_arp_req(sr, arp_req_send_iface, arp_req_target_ip);
+        if(entry){
+            memcpy(send_ehdr->ether_dhost, entry->mac, ETHER_ADDR_LEN);
+            memcpy(send_ehdr->ether_shost, arp_req_send_iface->addr, ETHER_ADDR_LEN);
 
-        /* Update time sent of ARP request to current time */
-        pthread_mutex_lock(&(sr->cache.lock));
-        request->sent = time(NULL);
-        request->times_sent = 1;
-        pthread_mutex_unlock(&(sr->cache.lock));
+            send_iphdr->ip_sum = 0;
+            send_iphdr->ip_sum = cksum(send_iphdr, sizeof(sr_ip_hdr_t));
+
+            sr_send_packet(sr, send_packet, send_len, arp_req_send_iface->name);
+            free(entry);
+            return;
+
+        }
+        else{
+            /* TODO*/
+            /* These two functions should always be together */
+            /* Store request in queue, note 2nd parameter is ARP request IP (not intended 
+                IP dest of packet that is being stored)*/
+            struct sr_arpreq* request = sr_arpcache_queuereq(&sr->cache, arp_req_target_ip,
+                                                                send_packet, send_len, original_rec_if->name);
+
+            
+
+            sr_send_arp_req(sr, arp_req_send_iface, arp_req_target_ip);
+
+            /* Update time sent of ARP request to current time */
+            pthread_mutex_lock(&(sr->cache.lock));
+            request->sent = time(NULL);
+            request->times_sent = 1;
+            pthread_mutex_unlock(&(sr->cache.lock));
+        }
 
    
     } else {
@@ -599,21 +629,28 @@ void sr_send_arp_req_again(struct sr_instance * sr, uint8_t * send_packet, uint3
     struct sr_rt * rtable_node = sr->routing_table;
 
     /* Try to find exact matching entry for next hop ip */
+    struct sr_rt * match_node = NULL;
+    uint32_t match_length; 
+
     while(rtable_node) {
         /* If destination ip in entry matches, break */
-        if (rtable_node->dest.s_addr == send_iphdr->ip_dst) {
-            break;            
+        uint32_t match = rtable_node->mask.s_addr & send_iphdr->ip_dst;
+        if (match == rtable_node->dest.s_addr) {
+            if(match_node==NULL || match_length < rtable_node->mask.s_addr){
+                match_node = rtable_node;
+                match_length = rtable_node->mask.s_addr;
+            }           
         }
-
         rtable_node = rtable_node->next;
     }
 
-    /* If matching entry found in routing table */
-    if (rtable_node) {
-        /* Get interface object from which to send */
-        struct sr_if * arp_req_send_iface = sr_get_interface(sr, rtable_node->interface);
 
-        if (arp_req_target_ip != rtable_node->gw.s_addr) {
+    /* If matching entry found in routing table */
+    if (match_node) {
+        /* Get interface object from which to send */
+        struct sr_if * arp_req_send_iface = sr_get_interface(sr, match_node->interface);
+
+        if (arp_req_target_ip != match_node->gw.s_addr) {
             fprintf(stderr, "Error, target ip changed for repeat arp request\n");
         }
    
@@ -717,19 +754,27 @@ void sr_send_ICMP_t0_packet(struct sr_instance * sr, uint8_t * old_packet,
     struct sr_rt * rtable_node = sr->routing_table;
 
     /* Try to find exact matching entry for next hop ip */
+    struct sr_rt * match_node = NULL;
+    uint32_t match_length; 
+
     while(rtable_node) {
         /* If destination ip in entry matches, break */
-        if (rtable_node->dest.s_addr == new_iphdr->ip_dst) {
-            break;            
+        uint32_t match = rtable_node->mask.s_addr & new_iphdr->ip_dst;
+        if (match == rtable_node->dest.s_addr) {
+            if(match_node==NULL || match_length < rtable_node->mask.s_addr){
+                match_node = rtable_node;
+                match_length = rtable_node->mask.s_addr;
+            }           
         }
-
         rtable_node = rtable_node->next;
     }
 
+
+
     /* If matching entry found in routing table */
-    if (rtable_node) {
+    if (match_node) {
         /* Get interface mac addr from which to send */
-        struct sr_if * send_iface = sr_get_interface(sr, rtable_node->interface);
+        struct sr_if * send_iface = sr_get_interface(sr, match_node->interface);
 
         /* 
         int i;
@@ -845,19 +890,26 @@ void sr_send_ICMP_t3_packet(struct sr_instance * sr, uint8_t * old_packet,
     struct sr_rt * rtable_node = sr->routing_table;
 
     /* Try to find exact matching entry for next hop ip */
+    struct sr_rt * match_node = NULL;
+    uint32_t match_length; 
+
     while(rtable_node) {
         /* If destination ip in entry matches, break */
-        if (rtable_node->dest.s_addr == new_iphdr->ip_dst) {
-            break;            
+        uint32_t match = rtable_node->mask.s_addr & new_iphdr->ip_dst;
+        if (match == rtable_node->dest.s_addr) {
+            if(match_node==NULL || match_length < rtable_node->mask.s_addr){
+                match_node = rtable_node;
+                match_length = rtable_node->mask.s_addr;
+            }           
         }
-
         rtable_node = rtable_node->next;
     }
 
+
     /* If matching entry found in routing table */
-    if (rtable_node) {
+    if (match_node) {
         /* Get interface mac addr from which to send */
-        struct sr_if * send_iface = sr_get_interface(sr, rtable_node->interface);
+        struct sr_if * send_iface =  sr_get_interface(sr, match_node->interface);
 
         if (send_iface != original_rec_if) {
             fprintf(stderr, "Just warning: sending interface for ICMP message not the same as original rec iface\n");
@@ -947,19 +999,25 @@ void sr_send_ICMP_t11_packet(struct sr_instance * sr, uint8_t * old_packet,
     struct sr_rt * rtable_node = sr->routing_table;
 
     /* Try to find exact matching entry for next hop ip */
+    struct sr_rt * match_node = NULL;
+    uint32_t match_length; 
+
     while(rtable_node) {
         /* If destination ip in entry matches, break */
-        if (rtable_node->dest.s_addr == new_iphdr->ip_dst) {
-            break;            
+        uint32_t match = rtable_node->mask.s_addr & new_iphdr->ip_dst;
+        if (match == rtable_node->dest.s_addr) {
+            if(match_node==NULL || match_length < rtable_node->mask.s_addr){
+                match_node = rtable_node;
+                match_length = rtable_node->mask.s_addr;
+            }           
         }
-
         rtable_node = rtable_node->next;
     }
 
     /* If matching entry found in routing table */
-    if (rtable_node) {
+    if (match_node) {
         /* Get interface mac addr from which to send */
-        struct sr_if * send_iface = sr_get_interface(sr, rtable_node->interface);
+        struct sr_if * send_iface = sr_get_interface(sr, match_node->interface);
 
         if (send_iface != original_rec_if) {
             fprintf(stderr, "Just warning: sending interface for ICMP message not the same as original rec iface\n");
